@@ -883,6 +883,132 @@ app.get('/api/audit/all', async (_req, res) => {
 app.get('/api/thread', async (req, res) => {
   const threadId = safeStr(req.query?.threadId).trim();
   if(!threadId) return res.status(400).json({ ok: false, err: 'missing_threadId' });
+
+app.post('/api/inbox/message', async (req, res) => {
+  try{
+    const p = req.body || {};
+    const threadId = safeStr(p?.threadId).trim();
+    const derived = splitThreadId(threadId);
+    const userId = lower(derived?.userId || p?.userId || p?.email || p?.userMeta?.email);
+    const profileNick = safeStr(p?.profileNick || derived?.profileNick).trim();
+    if(!userId || !threadId || !profileNick){
+      return res.status(400).json({ ok:false, err:'missing_fields' });
+    }
+
+    // Persist a stable userMeta snapshot (for operator UI)
+    const userMetaPatch = {
+      nick: safeStr(p?.nick || p?.userMeta?.nick || ''),
+      city: safeStr(p?.city || p?.userMeta?.city || ''),
+      county: safeStr(p?.county || p?.userMeta?.county || ''),
+      transport: safeStr(p?.transport || p?.userMeta?.transport || ''),
+      age: safeStr(p?.age || p?.userMeta?.age || ''),
+      birthYear: safeStr(p?.birthYear || p?.userMeta?.birthYear || ''),
+      gender: safeStr(p?.gender || p?.userMeta?.gender || ''),
+      profilePic: safeStr(p?.profilePic || p?.userMeta?.profilePic || ''),
+      hobbies: safeStr(p?.hobbies || p?.userMeta?.hobbies || ''),
+      work: safeStr(p?.work || p?.userMeta?.work || '')
+    };
+
+    await updateJson('threads.json', { threads: {}, assignments: {}, queue: [] }, (cur) => {
+      cur.threads = cur.threads || {};
+      const t = cur.threads[threadId] || { threadId, userId, profileNick, operatorId:'', userMeta:{}, profileMeta:{}, messages:[] };
+      t.userId = userId;
+      t.profileNick = profileNick;
+      t.userMeta = Object.assign({}, (t.userMeta||{}), userMetaPatch);
+      cur.threads[threadId] = t;
+      return cur;
+    });
+
+    // Credits (server authoritative)
+    const adminEmail = 'admin@forrovagy.hu';
+    const msgEmail = lower(p?.email || p?.userMeta?.email || '');
+    const isAdmin = (msgEmail === adminEmail) || (lower(userId) === adminEmail);
+    const cost = isAdmin ? 0 : 10;
+
+    if(cost > 0){
+      const rid = safeStr((p && (p.id || (p.meta && p.meta.id))) || '').trim() || (threadId + '|' + String(now()));
+      const debit = await debitCredits(userId, cost, rid);
+      if(!debit.ok){
+        return res.status(402).json({ ok:false, err:'insufficient_credits', required: cost, credits: Number(debit.credits||0) });
+      }
+      emitToUser(userId, 'credits:update', { credits: Number(debit.credits||0) });
+    } else {
+      emitToUser(userId, 'credits:update', { credits: await getCredits(userId) });
+    }
+
+    const op = await ensureAssignedServer(threadId);
+
+    const msg = await persistMessage({
+      threadId, userId, profileNick,
+      operatorId: op || '',
+      from: 'client',
+      text: p?.text || '',
+      img: p?.img || '',
+      meta: Object.assign({}, (p?.meta || null), (p?.id ? { id: String(p.id) } : null)),
+      id: p?.id
+    });
+
+    await appendAudit({
+      operatorId: op || '',
+      threadId,
+      userId,
+      profileNick,
+      direction: 'in',
+      text: msg.text,
+      img: msg.img,
+      ts: msg.ts,
+      meta: msg.meta || null
+    });
+
+    if(op){
+      const t = await getThread(threadId);
+      emitToOperator(op, 'chat:incoming', {
+        threadId,
+        userId,
+        profileNick,
+        text: msg.text,
+        img: msg.img,
+        meta: msg.meta,
+        profilePic: t?.userMeta?.profilePic || '',
+        profileMeta: t?.profileMeta || {},
+        userMeta: t?.userMeta || presence.users.get(userId) || {}
+      });
+      await sendOperatorThreads(op);
+    } else {
+      await enqueueThread(threadId);
+      await flushQueue();
+    }
+
+    return res.json({ ok:true, operatorId: op || null });
+  }catch(e){
+    return res.status(500).json({ ok:false, err:'server_error' });
+  }
+});
+
+app.get('/api/operator/threads', async (req, res) => {
+  const operatorId = lower(req.query?.operatorId || req.query?.email || '');
+  if(!operatorId) return res.status(400).json({ ok:false, err:'missing_operatorId' });
+  // Make sure any queued items get assigned if possible
+  await flushQueue();
+
+  const store = await loadThreads();
+  const threads = store.threads || {};
+  const out = [];
+  for(const tid of Object.keys(threads)){
+    const t = threads[tid];
+    if(!t || lower(t.operatorId) !== operatorId) continue;
+    out.push({
+      threadId: tid,
+      userId: t.userId,
+      profileNick: t.profileNick,
+      userMeta: t.userMeta || {},
+      profileMeta: t.profileMeta || {}
+    });
+  }
+  return res.json({ ok:true, threads: out });
+});
+
+
   const store = await loadThreads();
   const t = store.threads?.[threadId];
   if(!t) return res.json({ ok: false, err: 'not_found' });
@@ -1107,6 +1233,17 @@ async function unassignFromOperator(operatorId, reason='reassign'){
     }
   }
   await saveThreads(store);
+}
+
+
+async function enqueueThread(threadId){
+  const tid = safeStr(threadId).trim();
+  if(!tid) return;
+  await updateJson('threads.json', { threads: {}, assignments: {}, queue: [] }, (cur) => {
+    cur.queue = Array.isArray(cur.queue) ? cur.queue : [];
+    if(!cur.queue.includes(tid)) cur.queue.push(tid);
+    return cur;
+  });
 }
 
 async function flushQueue(){
@@ -1426,6 +1563,13 @@ if(cost > 0){
 });
         await sendOperatorThreads(op);
       }
+
+} else {
+  // No operator online right now: push this thread into the inbox/queue.
+  await enqueueThread(threadId);
+  await flushQueue(); // in case an operator connects right after
+}
+
     }catch(e){}
   });
 
